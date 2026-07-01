@@ -1,0 +1,261 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Auth / staff
+// ─────────────────────────────────────────────────────────────────────────
+
+enum Role {
+  OWNER
+  ADMIN
+  BARBER
+  FRONT_DESK
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String
+  role         Role
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  barber        Barber?
+  refreshTokens RefreshToken[]
+  createdAppointments Appointment[] @relation("AppointmentCreatedBy")
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// Singleton row (id is always 1) holding shop-wide scheduling defaults.
+// Individual barbers copy these into their own BarberWorkingHours on
+// creation and can then diverge from them freely.
+model ShopSettings {
+  id                   Int    @id @default(1)
+  name                 String @default("The Shop")
+  timezone             String @default("America/New_York")
+  defaultOpenMinute    Int    @default(540)  // 09:00, minutes from midnight
+  defaultCloseMinute   Int    @default(1080) // 18:00
+  defaultBufferMinutes Int    @default(10)
+  defaultOpenDays      Int[]  @default([1, 2, 3, 4, 5, 6]) // 0=Sun..6=Sat
+
+  @@map("shop_settings")
+}
+
+model Barber {
+  id                    String   @id @default(uuid())
+  userId                String   @unique
+  displayName           String
+  bio                   String?
+  active                Boolean  @default(true)
+  // null => inherit ShopSettings.defaultBufferMinutes
+  bufferMinutesOverride Int?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workingHours   BarberWorkingHours[]
+  services       BarberService[]
+  appointments   Appointment[]
+  timeBlocks     TimeBlock[]
+  clientNotes    ClientBarberNote[]
+
+  @@map("barbers")
+}
+
+// Per-barber, per-weekday working hours. Seeded from ShopSettings defaults
+// when a barber is created; isOff=true represents a day off.
+model BarberWorkingHours {
+  id           String  @id @default(uuid())
+  barberId     String
+  dayOfWeek    Int // 0=Sun..6=Sat
+  startMinute  Int // minutes from midnight
+  endMinute    Int
+  isOff        Boolean @default(false)
+
+  barber Barber @relation(fields: [barberId], references: [id], onDelete: Cascade)
+
+  @@unique([barberId, dayOfWeek])
+  @@map("barber_working_hours")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Services
+// ─────────────────────────────────────────────────────────────────────────
+
+model Service {
+  id              String   @id @default(uuid())
+  name            String
+  description     String?
+  durationMinutes Int
+  basePrice       Decimal  @db.Decimal(10, 2)
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  barberServices BarberService[]
+  appointments   Appointment[]
+
+  @@map("services")
+}
+
+// Join table: which services a barber offers, with an optional price
+// override (e.g. a senior barber charges more for the same haircut).
+// Duration is intentionally NOT overridable per-barber, since it drives
+// slot-grid math shop-wide and per-barber duration would fragment
+// availability calculations without a clear business need here.
+model BarberService {
+  id            String   @id @default(uuid())
+  barberId      String
+  serviceId     String
+  priceOverride Decimal? @db.Decimal(10, 2)
+  active        Boolean  @default(true)
+
+  barber  Barber  @relation(fields: [barberId], references: [id], onDelete: Cascade)
+  service Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  @@unique([barberId, serviceId])
+  @@map("barber_services")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Clients / CRM
+// ─────────────────────────────────────────────────────────────────────────
+
+model Client {
+  id                 String   @id @default(uuid())
+  name               String
+  phone              String   @unique
+  email              String?
+  // Shop-wide notes, e.g. allergy warnings, that any staff should see
+  generalNotes       String?
+  tags               String[] @default([])
+  noShowCount        Int      @default(0)
+  cancellationCount  Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  appointments Appointment[]
+  barberNotes  ClientBarberNote[]
+
+  @@index([phone])
+  @@index([name])
+  @@map("clients")
+}
+
+// Barber-specific preference notes about a client (e.g. "fades on the
+// sides, no scissor on top"), separate from Client.generalNotes so each
+// barber a client sees can keep their own cut notes.
+model ClientBarberNote {
+  id        String   @id @default(uuid())
+  clientId  String
+  barberId  String
+  note      String
+  updatedAt DateTime @updatedAt
+
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  barber Barber @relation(fields: [barberId], references: [id], onDelete: Cascade)
+
+  @@unique([clientId, barberId])
+  @@map("client_barber_notes")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Scheduling
+// ─────────────────────────────────────────────────────────────────────────
+
+enum AppointmentStatus {
+  BOOKED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum AppointmentSource {
+  ONLINE
+  WALK_IN
+  PHONE
+}
+
+model Appointment {
+  id        String            @id @default(uuid())
+  clientId  String
+  barberId  String
+  serviceId String
+  startTime DateTime
+  endTime   DateTime
+  status    AppointmentStatus @default(BOOKED)
+  source    AppointmentSource
+  notes     String? // notes taken after/about this specific visit
+  // snapshot of the price actually charged, since Service/BarberService
+  // prices can change after the fact
+  priceCharged Decimal? @db.Decimal(10, 2)
+
+  // opaque unguessable token used in the client-facing reschedule/cancel
+  // link; combined with phone/email re-entry as a second factor
+  cancelToken String @unique @default(uuid())
+
+  createdById String? // staff user who created it; null for client-initiated online bookings
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  cancelledAt DateTime?
+  completedAt DateTime?
+
+  reminderSentAt DateTime? // set once the 24hr-before reminder hook fires
+
+  client      Client      @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  barber      Barber      @relation(fields: [barberId], references: [id], onDelete: Restrict)
+  service     Service     @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  createdBy   User?       @relation("AppointmentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([barberId, startTime])
+  @@index([clientId])
+  @@index([status])
+  @@map("appointments")
+}
+
+enum TimeBlockReason {
+  LUNCH
+  PERSONAL
+  NO_SHOW_RESCHEDULE
+  OTHER
+}
+
+// Manual blocks a barber (or admin, on their behalf) puts on their own
+// calendar: lunch, personal time, blocking a slot after a no-show, etc.
+model TimeBlock {
+  id        String          @id @default(uuid())
+  barberId  String
+  startTime DateTime
+  endTime   DateTime
+  reason    TimeBlockReason
+  notes     String?
+  createdAt DateTime        @default(now())
+
+  barber Barber @relation(fields: [barberId], references: [id], onDelete: Cascade)
+
+  @@index([barberId, startTime])
+  @@map("time_blocks")
+}
